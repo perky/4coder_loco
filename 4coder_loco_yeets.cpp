@@ -1,19 +1,22 @@
 /* 
 // YEET SHEET. By Luke Perkin. luke@locogame.co.uk
-// Header comment last edited 20th 03/2021
+// Header comment last edited 21st 03/2021
 // 
 // "yeet" regions of text into a seperate buffer called a "yeet sheet". 
 // The yeet sheet will be kept in sync with any text changes. 
 // This allows you to have multiple portals into various files in your codebase.
 // 
 // == IMPLEMENTATION ==
-// #include "4coder_loco_yeets.cpp" in your custom layer. 
+// @include "4coder_loco_yeets.cpp" in your custom layer. 
 //
-// Call this is your custom layer's "render" function:
 // > loco_render_buffer(Application_Links *app, View_ID view_id, Face_ID face_id, Buffer_ID buffer, Text_Layout_ID text_layout_id, Rect_f32 rect, Frame_Info frame_info)
+// Call this is your custom layer's "render" hook.
 //
-// Call this in your custom layer's "on buffer edit" function:
 // > loco_on_buffer_edit(Application_Links *app, Buffer_ID buffer_id, Range_i64 old_range, Range_i64 new_range)
+// Call this in your custom layer's "on buffer edit" hook.
+//
+// > loco_yeet_on_buffer_end(Application_Links *app, Buffer_ID buffer_id)
+// Call this in your custom layer's "on buffer end" hook.
 //
 // == COMMANDS ==
 // The main command you will want to bind to a key is the yeet range command:
@@ -23,6 +26,10 @@
 // 
 // > loco_yeet_surrounding_function
 // Selects the surrounding function then yeets it.
+//
+// > loco_yeet_tag
+// Queries user for a string then searches all open buffers for that string
+// as a comment tag (i.e. "// @tag") and yeets the scope it precedes.
 // 
 // > loco_yeet_clear
 // Clears all current yeets.
@@ -44,10 +51,8 @@
 // > loco_load_yeet_snapshot_3
 // Loads a yeet snapshot into the yeet buffer.
 //
-// > loco_jump_from_yeet
-// > loco_jump_to_yeet
+// > loco_jump_between_yeet
 // Will attempt to jump to the corresponding location in the linked buffer.
-// These are automatically called with loco_yeet_selected_range_or_jump
 //
 // == CONFIG ==
 // There are currently a few global variables below, their variable names are self-explanatory.
@@ -56,7 +61,9 @@
 CUSTOM_ID(attachment, loco_marker_handle);
 CUSTOM_ID(attachment, loco_marker_pair_handle);
 
-//~ TYPES
+//--TYPES
+
+// @yeettype
 struct Loco_Marker_Pair
 {
     i32 start_marker_idx;
@@ -66,19 +73,21 @@ struct Loco_Marker_Pair
     Buffer_ID buffer;
 };
 
+// @yeettype
 struct Loco_Yeets
 {
     Loco_Marker_Pair pairs[1024];
     i32 pairs_count;
 };
 
+// @yeettype
 struct Loco_Yeets_Snapshots
 {
     Loco_Yeets snapshots[3];
     i32 snapshots_count;
 };
 
-//~ GLOBALS
+//--GLOBALS
 
 global bool loco_yeet_make_yeet_buffer_active_on_yeet = false;
 global bool loco_yeet_show_highlight_ranges = true;
@@ -99,7 +108,23 @@ global bool lock_yeet_buffer = false;
 // be as simple as saving a snapshot of the Loco_Yeets structure.
 global bool loco_yeets_delete_og_markers = false;
 
+//--IMPLEMENTATIONS
+
 //~
+static Buffer_ID
+loco_get_yeet_buffer(Application_Links *app)
+{
+    String_Const_u8 yeet_name = string_u8_litexpr("*yeet*");
+    Buffer_ID yeet_buffer = get_buffer_by_name(app, yeet_name, Access_Always);
+    if (!buffer_exists(app, yeet_buffer))
+    {
+        yeet_buffer = create_buffer(app, yeet_name, BufferCreate_AlwaysNew);
+        buffer_set_setting(app, yeet_buffer, BufferSetting_Unimportant, true);
+    }
+    return yeet_buffer;
+}
+
+//~ @marker @buffer
 static Marker*
 loco_get_buffer_markers(Application_Links *app, Arena *arena, Buffer_ID buffer_id, i32* count)
 {
@@ -112,7 +137,7 @@ loco_get_buffer_markers(Application_Links *app, Arena *arena, Buffer_ID buffer_i
     return markers;
 }
 
-//~
+//~ @marker @buffer @overwrite
 static void
 loco_overwrite_buffer_markers(Application_Links *app, Arena *arena, Buffer_ID buffer_id, Marker* markers, i32 count)
 {
@@ -128,7 +153,7 @@ loco_overwrite_buffer_markers(Application_Links *app, Arena *arena, Buffer_ID bu
     managed_object_store_data(app, *markers_obj, 0, count, markers);
 }
 
-//~
+//~ @overwrite
 static void
 loco_overwrite_yeets(Application_Links *app, Buffer_ID yeet_buffer, Loco_Yeets* yeets)
 {
@@ -145,7 +170,7 @@ loco_overwrite_yeets(Application_Links *app, Buffer_ID yeet_buffer, Loco_Yeets* 
     managed_object_store_data(app, *pair_obj, 0, 1, yeets);
 }
 
-//~
+//~ @buffer
 static Loco_Yeets
 loco_get_buffer_yeets(Application_Links *app, Buffer_ID buffer_id)
 {
@@ -156,7 +181,7 @@ loco_get_buffer_yeets(Application_Links *app, Buffer_ID buffer_id)
     return yeets;
 }
 
-//~
+//~ @marker @append
 // Append an array of markers to the buffer's managed objects.
 static i32
 loco_append_markers(Application_Links *app, Buffer_ID buffer_id, Marker* new_markers, i32 count)
@@ -186,7 +211,7 @@ loco_append_markers(Application_Links *app, Buffer_ID buffer_id, Marker* new_mar
     return marker_count;
 }
 
-//~
+//~ @marker @range
 // Pass in a buffer and a range of indices into a Marker array, this will retrieve the Markers
 // array from its scope. Use loco_make_range_from_markers if you already have the Markers.
 static Range_i64
@@ -195,12 +220,16 @@ loco_get_marker_range(Application_Links *app, Buffer_ID buffer_id, i32 start_idx
     Scratch_Block scratch(app);
     i32 count = 0;
     Marker* markers = loco_get_buffer_markers(app, scratch, buffer_id, &count);
-    i64 start = markers[start_idx].pos;
-    i64 end = markers[end_idx].pos;
-    return Ii64(start, end);
+    if (markers != 0)
+    {
+        i64 start = markers[start_idx].pos;
+        i64 end = markers[end_idx].pos;
+        return Ii64(start, end);
+    }
+    return Ii64(0, 0);
 }
 
-//~
+//~ @marker @range
 // Pass in an array of Markers and a range of indices to that array and this outputs
 // a Range of character positions.
 static Range_i64
@@ -212,6 +241,57 @@ loco_make_range_from_markers(Marker* markers, i32 start_idx, i32 end_idx)
 }
 
 //~
+static void
+loco_delete_marker_pair(Application_Links *app, Buffer_ID yeet_buffer, Loco_Yeets *yeets, i32 i)
+{
+    Scratch_Block scratch(app);
+    
+    // Swap delete pairs.
+    Loco_Marker_Pair pair = yeets->pairs[i];
+    yeets->pairs[i] = yeets->pairs[yeets->pairs_count-1];
+    yeets->pairs_count -= 1;
+    Loco_Marker_Pair &new_pair = yeets->pairs[i];
+    
+    // Need to swap out the indices too
+    // becuase we've swapped deleted the markers so their index has changed.
+    if (loco_yeets_delete_og_markers && new_pair.buffer == pair.buffer)
+    {
+        new_pair.start_marker_idx = pair.start_marker_idx;
+        new_pair.end_marker_idx = pair.end_marker_idx;
+    }
+    // Always need to set the yeet_marker indices.
+    new_pair.yeet_start_marker_idx = pair.yeet_start_marker_idx;
+    new_pair.yeet_end_marker_idx = pair.yeet_end_marker_idx;
+    
+    // Swap delete yeet markers.
+    i32 yeet_marker_count = 0;
+    Marker* yeet_markers = loco_get_buffer_markers(app, scratch, yeet_buffer, &yeet_marker_count);
+    yeet_markers[pair.yeet_start_marker_idx] = yeet_markers[yeet_marker_count - 2];
+    yeet_markers[pair.yeet_end_marker_idx] = yeet_markers[yeet_marker_count - 1];
+    yeet_marker_count -= 2;
+    
+    // Swap delete og markers.
+    if (loco_yeets_delete_og_markers)
+    {
+        i32 og_marker_count = 0;
+        Marker* og_markers = loco_get_buffer_markers(app, scratch, pair.buffer, &og_marker_count);
+        og_markers[pair.start_marker_idx] = og_markers[og_marker_count - 2];
+        og_markers[pair.end_marker_idx] = og_markers[og_marker_count - 1];
+        og_marker_count -= 2;
+        loco_overwrite_buffer_markers(app, scratch, pair.buffer, og_markers, og_marker_count);
+    }
+    
+    // Store markers in memory.
+    loco_overwrite_buffer_markers(app, scratch, yeet_buffer, yeet_markers, yeet_marker_count);
+    loco_overwrite_yeets(app, yeet_buffer, yeets);
+    
+    Range_i64 yeet_range = loco_make_range_from_markers(yeet_markers, pair.yeet_start_marker_idx, pair.yeet_end_marker_idx);
+    
+    String_Const_u8 empty_str = string_u8_litexpr("");
+    buffer_replace_range(app, yeet_buffer, yeet_range, empty_str);
+}
+
+//~ @buffer @edit
 static void
 loco_on_yeet_buffer_edit(Application_Links *app, Buffer_ID buffer_id, Range_i64 old_range, Range_i64 new_range)
 {
@@ -226,6 +306,8 @@ loco_on_yeet_buffer_edit(Application_Links *app, Buffer_ID buffer_id, Range_i64 
     for (size_t i = 0; i < yeets.pairs_count; i++)
     {
         Loco_Marker_Pair& pair = yeets.pairs[i];
+        if (!buffer_exists(app, pair.buffer)) continue;
+        
         Range_i64 yeet_range = loco_make_range_from_markers(yeet_markers, pair.yeet_start_marker_idx, pair.yeet_end_marker_idx);
         if (old_range.min > yeet_range.min && new_range.max < yeet_range.max)
         {
@@ -245,7 +327,7 @@ loco_on_yeet_buffer_edit(Application_Links *app, Buffer_ID buffer_id, Range_i64 
     }
 }
 
-//~
+//~ @buffer @edit
 static void
 loco_on_original_buffer_edit(Application_Links *app, Buffer_ID buffer_id, Range_i64 old_range, Range_i64 new_range)
 {
@@ -254,8 +336,7 @@ loco_on_original_buffer_edit(Application_Links *app, Buffer_ID buffer_id, Range_
     u8 insert_char = buffer_get_char(app, buffer_id, old_range.min);
     
     // Get the yeet buffer.
-    String_Const_u8 yeet_name = string_u8_litexpr("*yeet*");
-    Buffer_ID yeet_buffer = get_buffer_by_name(app, yeet_name, Access_Always);
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
     if (!buffer_exists(app, yeet_buffer) || buffer_id == yeet_buffer) return;
     
     // Check if this buffer exists in the yeet list.
@@ -299,7 +380,7 @@ loco_on_original_buffer_edit(Application_Links *app, Buffer_ID buffer_id, Range_
     }
 }
 
-//~
+//~ @api @buffer @edit
 api(LOCO) void 
 loco_on_buffer_edit(Application_Links *app, Buffer_ID buffer_id, Range_i64 old_range, Range_i64 new_range)
 {
@@ -321,7 +402,7 @@ loco_on_buffer_edit(Application_Links *app, Buffer_ID buffer_id, Range_i64 old_r
     }
 }
 
-//~
+//~ @api @buffer @render
 api(LOCO) void
 loco_render_buffer(Application_Links *app, View_ID view_id, Face_ID face_id,
                    Buffer_ID buffer, Text_Layout_ID text_layout_id,
@@ -342,6 +423,8 @@ loco_render_buffer(Application_Links *app, View_ID view_id, Face_ID face_id,
         for (i32 i = 0; i < yeets.pairs_count; i++)
         {
             Loco_Marker_Pair pair = yeets.pairs[i];
+            if (!buffer_exists(app, pair.buffer)) continue;
+            
             Range_i64 og_range = loco_get_marker_range(
                                                        app, pair.buffer, pair.start_marker_idx, pair.end_marker_idx);
             i64 start_line = get_line_number_from_pos(app, pair.buffer, og_range.min);
@@ -392,103 +475,92 @@ loco_render_buffer(Application_Links *app, View_ID view_id, Face_ID face_id,
     }
 }
 
-//~
-static bool
-loco_jump_to_buffer(Application_Links *app, Buffer_ID dst_buffer, i64 cursor, Range_i64 src_range, Range_i64 dst_range)
+//~ @api @buffer
+api(LOCO) void
+loco_on_buffer_end(Application_Links *app, Buffer_ID buffer_id)
 {
-    bool is_cursor_inside = (cursor >= src_range.min && cursor <= src_range.max);
-    if (is_cursor_inside)
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
+    Loco_Yeets yeets = loco_get_buffer_yeets(app, yeet_buffer);
+    for (i32 i = yeets.pairs_count - 1; i >= 0; i--)
     {
-        View_ID view = get_next_view_after_active(app, Access_Always);
-        view_set_buffer(app, view, dst_buffer, 0);
-        i64 relative_cursor_pos = dst_range.min + (cursor - src_range.min);
-        view_set_active(app, view);
-        view_set_cursor_and_preferred_x(app, view, seek_pos(relative_cursor_pos));
-        if (auto_center_after_jumps)
+        if (yeets.pairs[i].buffer == buffer_id)
         {
-            center_view(app);
+            loco_delete_marker_pair(app, yeet_buffer, &yeets, i);
         }
-        return true;
     }
-    return false;
 }
 
 //~
 static bool
-loco_try_jump_from_yeet(Application_Links *app)
+loco_is_cursor_inside_yeet(Application_Links *app, i64 cursor_pos, i64 *out_dst_cursor_pos, Buffer_ID *out_dst_buffer)
 {
     View_ID view = get_active_view(app, Access_Always);
     Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
-    String_Const_u8 yeet_name = string_u8_litexpr("*yeet*");
-    Buffer_ID yeet_buffer = get_buffer_by_name(app, yeet_name, Access_Always);
-    if (!buffer_exists(app, yeet_buffer) || buffer != yeet_buffer)
-    {
-        return false;
-    }
-    
-    Scratch_Block scratch(app);
-    i64 cursor = view_get_cursor_pos(app, view);
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
+    bool is_yeet_buffer = (buffer == yeet_buffer);
     Loco_Yeets yeets = loco_get_buffer_yeets(app, yeet_buffer);
-    i32 marker_count = 0;
-    Marker* markers = loco_get_buffer_markers(app, scratch, yeet_buffer, &marker_count);
+    
     for (i32 i = 0; i < yeets.pairs_count; i++)
     {
         Loco_Marker_Pair pair = yeets.pairs[i];
-        Range_i64 marker_range = loco_make_range_from_markers(
-                                                              markers, pair.yeet_start_marker_idx, pair.yeet_end_marker_idx);
-        Range_i64 og_range = loco_get_marker_range(
-                                                   app, pair.buffer, pair.start_marker_idx, pair.end_marker_idx);
-        if (loco_jump_to_buffer(app, pair.buffer, cursor, marker_range, og_range))
+        Buffer_ID src_buf = is_yeet_buffer ? yeet_buffer : pair.buffer;
+        i32 src_start = is_yeet_buffer ? pair.yeet_start_marker_idx : pair.start_marker_idx;
+        i32 src_end = is_yeet_buffer ? pair.yeet_end_marker_idx : pair.end_marker_idx;
+        Range_i64 src_range = loco_get_marker_range(app, src_buf, src_start, src_end);
+        bool is_cursor_inside = (cursor_pos >= src_range.min && cursor_pos <= src_range.max);
+        if (is_cursor_inside)
         {
+            Buffer_ID dst_buf = !is_yeet_buffer ? yeet_buffer : pair.buffer;
+            i32 dst_start = !is_yeet_buffer ? pair.yeet_start_marker_idx : pair.start_marker_idx;
+            i32 dst_end = !is_yeet_buffer ? pair.yeet_end_marker_idx : pair.end_marker_idx;
+            Range_i64 dst_range = loco_get_marker_range(app, dst_buf, dst_start, dst_end);
+            if (out_dst_cursor_pos != 0)
+            {
+                *out_dst_cursor_pos = dst_range.min + (cursor_pos - src_range.min);
+            }
+            if (out_dst_buffer != 0)
+            {
+                *out_dst_buffer = dst_buf;
+            }
             return true;
         }
     }
+    
     return false;
 }
 
-//~
+//~ @jump @buffer
+static void
+loco_jump_to_buffer(Application_Links *app, Buffer_ID dst_buffer, i64 dst_cursor)
+{
+    View_ID view = get_next_view_after_active(app, Access_Always);
+    view_set_buffer(app, view, dst_buffer, 0);
+    view_set_active(app, view);
+    view_set_cursor_and_preferred_x(app, view, seek_pos(dst_cursor));
+    if (auto_center_after_jumps)
+    {
+        center_view(app);
+    }
+}
+
+//~ @jump
 static bool
-loco_try_jump_to_yeet(Application_Links *app)
+loco_try_jump_between_yeet_pair(Application_Links *app)
 {
     View_ID view = get_active_view(app, Access_Always);
     Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
-    String_Const_u8 yeet_name = string_u8_litexpr("*yeet*");
-    Buffer_ID yeet_buffer = get_buffer_by_name(app, yeet_name, Access_Always);
-    if (!buffer_exists(app, yeet_buffer) || buffer == yeet_buffer)
+    i64 cursor_pos = view_get_cursor_pos(app, view);
+    i64 dst_cursor_pos = 0;
+    Buffer_ID dst_buffer = 0;
+    bool success = loco_is_cursor_inside_yeet(app, cursor_pos, &dst_cursor_pos, &dst_buffer);
+    if (success)
     {
-        return false;
+        loco_jump_to_buffer(app, dst_buffer, dst_cursor_pos);
     }
-    
-    Scratch_Block scratch(app);
-    i64 cursor = view_get_cursor_pos(app, view);
-    i32 og_marker_count = 0;
-    Marker* og_markers = loco_get_buffer_markers(
-                                                 app, scratch, buffer, &og_marker_count);
-    if (og_markers == nullptr) return false;
-    
-    i32 yeet_marker_count = 0;
-    Marker* yeet_markers = loco_get_buffer_markers(
-                                                   app, scratch, yeet_buffer, &yeet_marker_count);
-    Loco_Yeets yeets = loco_get_buffer_yeets(app, yeet_buffer);
-    for (i32 i = 0; i < yeets.pairs_count; i++)
-    {
-        Loco_Marker_Pair pair = yeets.pairs[i];
-        if (pair.buffer != buffer) continue;
-        
-        Range_i64 yeet_range = loco_make_range_from_markers(
-                                                            yeet_markers, pair.yeet_start_marker_idx, pair.yeet_end_marker_idx);
-        Range_i64 og_range = loco_make_range_from_markers(
-                                                          og_markers, pair.start_marker_idx, pair.end_marker_idx);
-        
-        if (loco_jump_to_buffer(app, yeet_buffer, cursor, og_range, yeet_range))
-        {
-            return true;
-        }
-    }
-    return false;
+    return success;
 }
 
-//~
+//~ @buffer
 // Copies text region from one buffer to another buffer (appends to end)
 // Returns the insertion region in the dest buffer.
 static Range_i64
@@ -506,8 +578,7 @@ loco_copy_buffer_text_to_buffer(Application_Links *app,
     
     // Insert range to yeet buffer.
     lock_yeet_buffer = true;
-    Buffer_Insertion insert = begin_buffer_insertion_at_buffered(
-                                                                 app, dst_buffer, dst_insert_start, arena, KB(16));
+    Buffer_Insertion insert = begin_buffer_insertion_at_buffered(app, dst_buffer, dst_insert_start, arena, KB(16));
     insertc(&insert, '\n');
     insert_string(&insert, copy_string);
     insertc(&insert, '\n');
@@ -523,7 +594,7 @@ loco_copy_buffer_text_to_buffer(Application_Links *app,
     return Ii64(dst_insert_start + 1, dst_insert_end - 2);
 }
 
-//~
+//~ @marker @append
 // Append two markers that sit and the start and end of a range.
 static i32
 loco_append_marker_range(Application_Links *app, Buffer_ID buffer, Range_i64 range)
@@ -536,30 +607,26 @@ loco_append_marker_range(Application_Links *app, Buffer_ID buffer, Range_i64 ran
     return loco_append_markers(app, buffer, markers, 2);
 }
 
-//~
+//~ @snapshot
 static void
 loco_save_yeet_snapshot_to_slot(Application_Links *app, i32 slot)
 {
-    String_Const_u8 yeet_name = string_u8_litexpr("*yeet*");
-    Buffer_ID yeet_buffer = get_buffer_by_name(app, yeet_name, Access_Always);
-    if (!buffer_exists(app, yeet_buffer)) return;
-    
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
     Loco_Yeets yeets = loco_get_buffer_yeets(app, yeet_buffer);
     yeets_snapshots.snapshots[slot] = yeets;
 }
 
-//~
+//~ @snapshot
 static void
 loco_load_yeet_snapshot_from_slot(Application_Links *app, i32 slot)
 {
-    String_Const_u8 yeet_name = string_u8_litexpr("*yeet*");
-    Buffer_ID yeet_buffer = get_buffer_by_name(app, yeet_name, Access_Always);
-    if (!buffer_exists(app, yeet_buffer)) return;
-    
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
     loco_yeet_clear(app);
     Loco_Yeets unsorted_yeets = yeets_snapshots.snapshots[slot];
     
     Scratch_Block scratch(app);
+    
+    // Sort the pairs by the yeet_buffer marker index.
     Sort_Pair_i32* yeet_sorter = push_array(scratch, Sort_Pair_i32, unsorted_yeets.pairs_count);
     for (i32 i = 0; i < unsorted_yeets.pairs_count; i += 1){
         yeet_sorter[i].index = i;
@@ -573,6 +640,18 @@ loco_load_yeet_snapshot_from_slot(Application_Links *app, i32 slot)
         yeets.pairs[i] = unsorted_yeets.pairs[yeet_sorter[i].index];
     }
     
+    // Delete all mentions of buffers that no longer exist.
+    for (i32 i = yeets.pairs_count - 1; i >= 0; i--)
+    {
+        if (!buffer_exists(app, yeets.pairs[i].buffer))
+        {
+            // Swap delete.
+            yeets.pairs[i] = yeets.pairs[yeets.pairs_count-1];
+            yeets.pairs_count -= 1;
+        }
+    }
+    
+    // Insert the text into the yeet_buffer.
     for (i32 i = 0; i < yeets.pairs_count; i++)
     {
         Loco_Marker_Pair pair = yeets.pairs[i];
@@ -594,47 +673,14 @@ loco_load_yeet_snapshot_from_slot(Application_Links *app, i32 slot)
     }
 }
 
-//~
-CUSTOM_COMMAND_SIG(loco_jump_from_yeet)
-CUSTOM_DOC("Jumps from the yeet sheet to the original buffer.")
+//~ @buffer
+static void
+loco_yeet_buffer_range(Application_Links *app, Buffer_ID buffer, Range_i64 range)
 {
-    loco_try_jump_from_yeet(app);
-}
-
-//~
-CUSTOM_COMMAND_SIG(loco_jump_to_yeet)
-CUSTOM_DOC("Jumps to a yeet sheet from an original buffer.")
-{
-    loco_try_jump_to_yeet(app);
-}
-
-//~
-CUSTOM_COMMAND_SIG(loco_yeet_selected_range_or_jump)
-CUSTOM_DOC("Yeets some code into a yeet buffer.")
-{
-    View_ID view = get_active_view(app, Access_Always);
-    Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
-    Range_i64 range = get_view_range(app, view);
-    
-    String_Const_u8 yeet_name = string_u8_litexpr("*yeet*");
-    Buffer_ID yeet_buffer = get_buffer_by_name(app, yeet_name, Access_Always);
-    if (!buffer_exists(app, yeet_buffer)){
-        yeet_buffer = create_buffer(app, yeet_name, BufferCreate_AlwaysNew);
-        buffer_set_setting(app, yeet_buffer, BufferSetting_Unimportant, true);
-    }
-    
-    // The "or jump" part.
-    if (buffer == yeet_buffer)
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
+    if (buffer == yeet_buffer || loco_is_cursor_inside_yeet(app, range.min, 0, 0))
     {
-        // If we try to yeet inside the yeet_buffer, go to the original buffer instead.
-        loco_try_jump_from_yeet(app);
         return;
-    }
-    else
-    {
-        // If we try to yeet inside an already existing yeet marker range inside
-        // the original buffer, then jump to that linked location in the yeet buffer.
-        if (loco_try_jump_to_yeet(app)) return;
     }
     
     i32 old_marker_idx = loco_append_marker_range(app, buffer, range);
@@ -673,7 +719,30 @@ CUSTOM_DOC("Yeets some code into a yeet buffer.")
     managed_object_store_data(app, *pair_obj, 0, 1, &yeets);
 }
 
-//~
+//~ @command
+CUSTOM_COMMAND_SIG(loco_jump_between_yeet)
+CUSTOM_DOC("Jumps from the yeet sheet to the original buffer or vice versa.")
+{
+    loco_try_jump_between_yeet_pair(app);
+}
+
+//~ @command
+CUSTOM_COMMAND_SIG(loco_yeet_selected_range_or_jump)
+CUSTOM_DOC("Yeets some code into a yeet buffer.")
+{
+    View_ID view = get_active_view(app, Access_Always);
+    Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
+    Range_i64 range = get_view_range(app, view);
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
+    
+    // The "or jump" part.
+    if (loco_try_jump_between_yeet_pair(app))
+        return;
+    
+    loco_yeet_buffer_range(app, buffer, range);
+}
+
+//~ @command
 CUSTOM_COMMAND_SIG(loco_yeet_surrounding_function)
 CUSTOM_DOC("Selects the surrounding function scope and yeets it.")
 { 
@@ -699,13 +768,11 @@ CUSTOM_DOC("Selects the surrounding function scope and yeets it.")
     loco_yeet_selected_range_or_jump(app);
 }
 
-//~
+//~ @command
 CUSTOM_COMMAND_SIG(loco_yeet_clear)
 CUSTOM_DOC("Clears all yeets.")
 {
-    String_Const_u8 yeet_name = string_u8_litexpr("*yeet*");
-    Buffer_ID yeet_buffer = get_buffer_by_name(app, yeet_name, Access_Always);
-    if (!buffer_exists(app, yeet_buffer)) return;
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
     
     Loco_Yeets yeets = loco_get_buffer_yeets(app, yeet_buffer);
     if (loco_yeets_delete_og_markers)
@@ -730,7 +797,7 @@ CUSTOM_DOC("Clears all yeets.")
     clear_buffer(app, yeet_buffer);
 }
 
-//~
+//~ @command
 CUSTOM_COMMAND_SIG(loco_yeet_reset_all)
 CUSTOM_DOC("Clears all yeets in all snapshots, also clears all the markers.")
 {
@@ -747,24 +814,25 @@ CUSTOM_DOC("Clears all yeets in all snapshots, also clears all the markers.")
     yeets_snapshots = {};
 }
 
-//~
+//~ @command
 CUSTOM_COMMAND_SIG(loco_yeet_remove_marker_pair)
 CUSTOM_DOC("Removes the marker pair the cursor is currently inside.")
 {
-    String_Const_u8 yeet_name = string_u8_litexpr("*yeet*");
-    Buffer_ID yeet_buffer = get_buffer_by_name(app, yeet_name, Access_Always);
-    if (!buffer_exists(app, yeet_buffer)) return;
     
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
     View_ID view = get_active_view(app, Access_Always);
     Buffer_ID buffer = view_get_buffer(app, view, Access_Always);
+    i64 cursor_pos = view_get_cursor_pos(app, view);
+    if (!loco_is_cursor_inside_yeet(app, cursor_pos, 0, 0)) return;
     
     // If we're in the original buffer,
     // try to jump to the relative location in the yeet before.
     // That way I just keep the one branch of logic for deleting
     // from the yeet buffer only.
+    View_ID cached_view = view;
     if (buffer != yeet_buffer)
     {
-        loco_try_jump_to_yeet(app);
+        loco_try_jump_between_yeet_pair(app);
         view = get_active_view(app, Access_Always);
         buffer = view_get_buffer(app, view, Access_Always);
     }
@@ -776,93 +844,214 @@ CUSTOM_DOC("Removes the marker pair the cursor is currently inside.")
         Loco_Yeets yeets = loco_get_buffer_yeets(app, yeet_buffer);
         i32 yeet_marker_count = 0;
         Marker* yeet_markers = loco_get_buffer_markers(app, scratch, yeet_buffer, &yeet_marker_count);
-        for (i32 i = 0; i < yeets.pairs_count; i++)
+        for (i32 i = yeets.pairs_count - 1; i >= 0; i--)
         {
             Loco_Marker_Pair pair = yeets.pairs[i];
             Range_i64 yeet_range = loco_make_range_from_markers(
                                                                 yeet_markers, pair.yeet_start_marker_idx, pair.yeet_end_marker_idx);
             if (range.max > yeet_range.min && range.max < yeet_range.max)
             {
-                i32 og_marker_count = 0;
-                Marker* og_markers = loco_get_buffer_markers(app, scratch, pair.buffer, &og_marker_count);
-                
-                // Swap delete pairs.
-                yeets.pairs[i] = yeets.pairs[yeets.pairs_count-1];
-                yeets.pairs_count -= 1;
-                
-                // Need to swap out the indices too
-                // becuase we've swapped deleted the markers so their index has changed.
-                if (loco_yeets_delete_og_markers && yeets.pairs[i].buffer == pair.buffer)
-                {
-                    yeets.pairs[i].start_marker_idx = pair.start_marker_idx;
-                    yeets.pairs[i].end_marker_idx = pair.end_marker_idx;
-                }
-                // Always need to set the yeet_marker indices.
-                yeets.pairs[i].yeet_start_marker_idx = pair.yeet_start_marker_idx;
-                yeets.pairs[i].yeet_end_marker_idx = pair.yeet_end_marker_idx;
-                
-                // Swap delete yeet markers.
-                yeet_markers[pair.yeet_start_marker_idx] = yeet_markers[yeet_marker_count - 2];
-                yeet_markers[pair.yeet_end_marker_idx] = yeet_markers[yeet_marker_count - 1];
-                yeet_marker_count -= 2;
-                
-                // Swap delete og markers.
-                if (loco_yeets_delete_og_markers)
-                {
-                    og_markers[pair.start_marker_idx] = og_markers[og_marker_count - 2];
-                    og_markers[pair.end_marker_idx] = og_markers[og_marker_count - 1];
-                    og_marker_count -= 2;
-                }
-                
-                // Store markers in memory.
-                loco_overwrite_buffer_markers(app, scratch, yeet_buffer, yeet_markers, yeet_marker_count);
-                loco_overwrite_buffer_markers(app, scratch, pair.buffer, og_markers, og_marker_count);
-                loco_overwrite_yeets(app, yeet_buffer, &yeets);
-                
-                String_Const_u8 empty_str = string_u8_litexpr("");
-                buffer_replace_range(app, yeet_buffer, yeet_range, empty_str);
-                
+                loco_delete_marker_pair(app, yeet_buffer, &yeets, i);
                 break;
             }
         }
-        return;
+        
+        view_set_active(app, cached_view);
     }
 }
 
-//~ Snapshots
+//--SNAPSHOTS
 
+//~ @command @snapshot
 CUSTOM_COMMAND_SIG(loco_save_yeet_snapshot_1)
 CUSTOM_DOC("Save yeets snapshot to slot 1.")
 {
     loco_save_yeet_snapshot_to_slot(app, 0);
 }
 
+//~ @command @snapshot
 CUSTOM_COMMAND_SIG(loco_save_yeet_snapshot_2)
 CUSTOM_DOC("Save yeets snapshot to slot 2.")
 {
     loco_save_yeet_snapshot_to_slot(app, 1);
 }
 
+//~ @command @snapshot
 CUSTOM_COMMAND_SIG(loco_save_yeet_snapshot_3)
 CUSTOM_DOC("Save yeets snapshot to slot 3.")
 {
     loco_save_yeet_snapshot_to_slot(app, 2);
 }
 
+//~ @command @snapshot
 CUSTOM_COMMAND_SIG(loco_load_yeet_snapshot_1)
 CUSTOM_DOC("Load yeets snapshot from slot 1.")
 {
     loco_load_yeet_snapshot_from_slot(app, 0);
 }
 
+//~ @command @snapshot
 CUSTOM_COMMAND_SIG(loco_load_yeet_snapshot_2)
 CUSTOM_DOC("Load yeets snapshot from slot 2.")
 {
     loco_load_yeet_snapshot_from_slot(app, 1);
 }
 
+//~ @command @snapshot
 CUSTOM_COMMAND_SIG(loco_load_yeet_snapshot_3)
 CUSTOM_DOC("Load yeets snapshot from slot 3.")
 {
     loco_load_yeet_snapshot_from_slot(app, 2);
 }
+
+//--CATEGORIES
+
+// @yeettags @yeettype
+enum Loco_Yeet_Tags_Parse_State
+{
+    Loco_Tag_PState_Looking_For_Tag,
+    Loco_Tag_PState_Reading_Word,
+    Loco_Tag_PState_End_Of_Word,
+    Loco_Tag_PState_Looking_For_Comment,
+    Loco_Tag_PState_Looking_For_Scope_Start,
+    Loco_Tag_PState_Looking_For_Scope_End
+};
+
+// @yeettags @yeettype
+struct Loco_Yeet_Tag_Range
+{
+    Range_i64 range;
+};
+
+//~ @yeettags
+static void
+loco_yeet_all_scopes_with_tag(Application_Links *app, Buffer_ID buffer, String_Const_u8 tag_name)
+{
+    Token_Array token_arr = get_token_array_from_buffer(app, buffer);
+    if (token_arr.tokens == 0) return;
+    
+    Scratch_Block scratch(app);
+    Token_Iterator_Array it = token_iterator_index(buffer, &token_arr, 0);
+    Loco_Yeet_Tag_Range tag_ranges[1024];
+    u64 tag_ranges_count = 0;
+    Loco_Yeet_Tags_Parse_State root_parse_state = Loco_Tag_PState_Looking_For_Comment;
+    u64 scope_enter_count = 0;
+    
+    for(Token* tok = token_it_read(&it);
+        tok != 0;
+        tok = token_it_read(&it))
+    {
+        if (HasFlag(tok->flags, TokenBaseFlag_PreprocessorBody))
+        {
+            if (!token_it_inc_non_whitespace(&it)) break;
+            continue;
+        }
+        
+        if (tok->sub_kind == TokenCppKind_LineComment && root_parse_state == Loco_Tag_PState_Looking_For_Comment)
+        {
+            String_Const_u8 tok_str = push_buffer_range(app, scratch, buffer, Ii64(tok));
+            Loco_Yeet_Tags_Parse_State parse_state = Loco_Tag_PState_Looking_For_Tag;
+            i64 tag_start = 0;
+            i64 tag_end = 0;
+            bool found_tag = false;
+            
+            for (u64 i = 0; i <= tok_str.size; i++)
+            {
+                u8 c = (i < tok_str.size) ? tok_str.str[i] : 0;
+                switch(parse_state)
+                {
+                    case Loco_Tag_PState_Looking_For_Tag: {
+                        if (c == '@')
+                        {
+                            parse_state = Loco_Tag_PState_Reading_Word;
+                            tag_start = i+1;
+                        }
+                        break;
+                    }
+                    case Loco_Tag_PState_Reading_Word: {
+                        bool is_lower_alpha = (c >= 'a' && c <= 'z');
+                        bool is_upper_alpha = (c >= 'A' && c <= 'Z');
+                        bool is_numeric = (c >= '0' && c <= '9');
+                        bool is_alphanumeric = (is_lower_alpha || is_upper_alpha || is_numeric);
+                        if (!is_alphanumeric)
+                        {
+                            parse_state = Loco_Tag_PState_End_Of_Word;
+                            tag_end = i;
+                        }
+                        break;
+                    }
+                }
+                
+                if (parse_state == Loco_Tag_PState_End_Of_Word)
+                {
+                    parse_state = Loco_Tag_PState_Looking_For_Tag;
+                    String_Const_u8 sub = string_substring(tok_str, Ii64(tag_start, tag_end));
+                    if (string_match(sub, tag_name))
+                    {
+                        found_tag = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (found_tag)
+            {
+                root_parse_state = Loco_Tag_PState_Looking_For_Scope_Start;
+                tag_ranges[tag_ranges_count].range.min = tok->pos;
+            }
+        }
+        
+        if (tok->sub_kind == TokenCppKind_BraceOp)
+        {
+            if (root_parse_state == Loco_Tag_PState_Looking_For_Scope_Start)
+            {
+                scope_enter_count = 1;
+                root_parse_state = Loco_Tag_PState_Looking_For_Scope_End;
+            }
+            else if (root_parse_state == Loco_Tag_PState_Looking_For_Scope_End)
+            {
+                scope_enter_count += 1;
+            }
+        }
+        
+        if (tok->sub_kind == TokenCppKind_BraceCl && root_parse_state == Loco_Tag_PState_Looking_For_Scope_End)
+        {
+            scope_enter_count -= 1;
+            if (scope_enter_count == 0)
+            {
+                root_parse_state = Loco_Tag_PState_Looking_For_Comment;
+                tag_ranges[tag_ranges_count].range.max = tok->pos+1;
+                tag_ranges_count += 1;
+            }
+        }
+        
+        if (!token_it_inc_non_whitespace(&it)) break;
+    }
+    
+    for (u64 i = 0; i < tag_ranges_count; i++)
+    {
+        loco_yeet_buffer_range(app, buffer, tag_ranges[i].range);
+    }
+}
+
+//--TAG-COMMANDS
+
+// @command @yeettags
+CUSTOM_COMMAND_SIG(loco_yeet_tag)
+CUSTOM_DOC("Find all locations of a comment tag (//@tag) in all buffers and yeet the scope they precede.")
+{
+    Scratch_Block scratch(app);
+    u8 *space = push_array(scratch, u8, KB(1));
+    String_Const_u8 tag_name = get_query_string(app, "Yeet Tag: ", space, KB(1));
+    Buffer_ID yeet_buffer = loco_get_yeet_buffer(app);
+    for (Buffer_ID buffer = get_buffer_next(app, 0, Access_ReadWriteVisible);
+         buffer != 0;
+         buffer = get_buffer_next(app, buffer, Access_ReadWriteVisible))
+    {
+        if (buffer == yeet_buffer) continue;
+        
+        loco_yeet_all_scopes_with_tag(app, buffer, tag_name);
+    }
+}
+
+
